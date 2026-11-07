@@ -1,0 +1,13 @@
+[package]
+name = "raftkv"
+version = "0.1.0"
+edition = "2021"
+description = "A from-scratch, Raft-replicated key-value store in Rust"
+
+[dependencies]
+# Intentionally empty for now: the storage layer uses only the standard library.
+# Dependencies (e.g. a serialization crate or an async runtime) get added
+# deliberately, when a phase of the roadmap actually needs them.
+
+[profile.release]
+debug = true # keep symbols so profilers give readable output during benchmarking
