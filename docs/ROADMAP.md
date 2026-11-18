@@ -1,65 +1,93 @@
 # Roadmap
 
-Rough pacing assumes part-time work; adjust freely. Check items off as you go.
+Part-time project, so the week numbers are guesses. I'll move things around as I learn how long they actually take.
 
-## Phase 0: Foundations (week 1)
-- [x] Repo, README skeleton, CI (fmt, clippy, tests)
-- [ ] Read the Raft paper end to end; study Figure 2 (see [RAFT_NOTES.md](RAFT_NOTES.md))
-- [ ] Play with the visualization at https://raft.github.io
-- [ ] Skim the Raft thesis sections on log compaction and cluster membership
+The order matters more than the dates: get one node solid, write Raft as a pure function, build a simulator that tries to break it, and only then add real sockets.
 
-## Phase 1: Single-node durable store (week 1-2)
+## Phase 0: Reading
+
+- [x] Repo, README, CI (fmt, clippy, tests)
+- [ ] CI passing on GitHub
+- [ ] Read the Raft paper start to finish. Re-read Figure 2 with a pencil (notes in [RAFT_NOTES.md](RAFT_NOTES.md))
+- [ ] Click through https://raft.github.io until elections and log repair make sense
+- [ ] Skim the thesis chapters on log compaction and membership changes
+
+## Phase 1: Single-node store
+
 - [x] `Command` encoding
 - [x] Write-ahead log with CRC32 and torn-tail recovery
-- [x] `StateMachine` separated from durability
-- [x] Interactive shell
-- [x] Crash-recovery tests
-- [ ] Run `cargo test`, `cargo fmt`, `cargo clippy` locally and push the first commit
+- [x] `StateMachine` kept separate from durability
+- [x] Small interactive shell
+- [x] Crash recovery tests
+- [x] First push
 
-## Phase 2: Raft core as a pure state machine (weeks 2-4)
-Design: `RaftNode::step(event) -> Vec<Action>`, with no sockets, threads, or
-wall-clock time inside.
+### Phase 1.5: WAL cleanup
+
+Raft will sit on top of this file, so I want it right before moving on.
+
+- [ ] After a failed append, refuse further writes until the log is reopened (a half-written record must never be followed by good ones)
+- [ ] fsync the parent directory when creating a new log file
+- [ ] Tests for both
+
+## Phase 2: Raft core as a pure state machine
+
+`RaftNode::step(event) -> Vec<Action>`. No sockets, threads, or real clocks inside. Time is counted in ticks and the election timeout comes from a seeded RNG.
+
 - [ ] Types: `Term`, `LogIndex`, `NodeId`, `LogEntry { term, command }`
-- [ ] Persistent state: `currentTerm`, `votedFor`, `log[]`
-- [ ] Leader election: election timeout, `RequestVote`, vote granting rules
-- [ ] Heartbeats and log replication: `AppendEntries`, `nextIndex`/`matchIndex`
-- [ ] Commit rule (majority + current-term entry) and applying to the state machine
+- [ ] Persistent state: `currentTerm`, `votedFor`, `log[]`, written through `Persist*` actions
+- [ ] Rule: persist actions finish before any `Send` goes out
+- [ ] Leader election: timeouts, `RequestVote`, vote granting rules
+- [ ] Heartbeats and replication: `AppendEntries`, `nextIndex` / `matchIndex`
+- [ ] Leader appends a no-op entry when elected (needed to commit entries from older terms)
+- [ ] Commit rule (majority, and only for entries from the current term)
+- [ ] Apply committed entries to the `StateMachine`
 - [ ] Unit tests for each rule in Figure 2
 
-## Phase 3: Deterministic simulation harness (weeks 4-6)
-This is the part that makes the project stand out.
-- [ ] Simulated clock and network (drop, delay, duplicate, reorder, partition)
-- [ ] Seeded randomness so every failing run can be replayed exactly
-- [ ] Crash and restart nodes (losing volatile state, keeping the persisted log)
-- [ ] Invariant checks after every step (election safety, log matching,
-      leader completeness, state machine safety)
-- [ ] Run thousands of random schedules in CI
+## Phase 3: Simulator
 
-## Phase 4: Real networking (weeks 6-7)
-- [ ] `Transport` trait; simulated and TCP implementations
-- [ ] Node binary with config (id, peers, data dir)
-- [ ] Client protocol with leader redirect and request deduplication
+The part I most want to get right.
+
+- [ ] Fake clock and fake network: drop, delay, duplicate, reorder, partition
+- [ ] Seeded randomness, so any failing run can be replayed exactly
+- [ ] Simulated disk that throws away anything not fsynced when a node crashes
+- [ ] Crash and restart nodes (volatile state lost, persisted state kept)
+- [ ] Invariants checked after every step: election safety, log matching, leader completeness, state machine safety
+- [ ] Record client operations and check them for linearizability (simple checker first)
+- [ ] Run thousands of seeds in CI
+
+**Good stopping point.** If I get through Phase 3, the project is already worth showing: a Raft implementation plus a simulator that checks it. I'll update the resume and README here instead of waiting for the end.
+
+## Phase 4: Real networking
+
+- [ ] `Transport` trait with a simulated version and a TCP version
+- [ ] Node binary with config (id, peers, data directory)
+- [ ] Client protocol: leader redirect, request deduplication
 - [ ] Docker Compose file for a 3-node cluster
 
-## Phase 5: Durability and compaction (weeks 7-8)
-- [ ] Persist Raft state (term, vote, log) with fsync discipline
-- [ ] Snapshots and log compaction; `InstallSnapshot`
-- [ ] Group commit / batching to reduce fsync cost
+## Phase 5: Snapshots and batching
 
-## Phase 6: Correctness evidence and benchmarks (weeks 8-10)
-- [ ] Record client histories and check linearizability
-- [ ] Benchmarks: writes/sec, p50/p99 latency, 3 vs 5 nodes, sync vs batched
-- [ ] Failover time measurements (kill the leader, time until writes succeed)
-- [ ] Publish graphs and methodology in the README
+- [ ] Snapshots and log compaction
+- [ ] `InstallSnapshot` for followers that fall too far behind
+- [ ] Group commit to cut down on fsync cost
+- [ ] Faster startup (no more replaying the whole log)
 
-## Stretch goals
-- [ ] Cluster membership changes
-- [ ] Read optimizations (read index or leader leases)
-- [ ] Sharding across multiple Raft groups
-- [ ] Web dashboard or terminal UI showing leader, terms, and log state
-- [ ] Short screen recording of killing the leader and the cluster recovering
+## Phase 6: Measuring it
 
-## Known limitations (be upfront about these in the README)
-- The Phase 1 WAL replays the whole file on startup (fixed by snapshots in Phase 5).
-- `fsync` per write limits throughput (addressed by batching in Phase 5).
-- CRC32 is bitwise and unoptimized; replace with a table-driven version if profiling shows it matters.
+- [ ] Run the linearizability checker against the real cluster, not just the simulator
+- [ ] Benchmarks: writes per second, p50 and p99 latency, 3 nodes vs 5, synced vs batched
+- [ ] Failover time: kill the leader, time how long until writes work again
+- [ ] Graphs and method in the README
+
+## Maybe later
+
+- Membership changes
+- Read optimizations (read index or leader leases)
+- Several Raft groups (sharding)
+- Terminal UI showing leader, terms, and log state
+- A short screen recording of killing the leader and the cluster recovering
+
+## Known limitations
+
+- Startup replays the entire WAL until snapshots exist (Phase 5).
+- One fsync per write caps throughput until batching exists (Phase 5).
+- CRC32 is a bitwise implementation. Swap in a table-driven one if profiling says it matters.
