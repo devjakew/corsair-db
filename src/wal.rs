@@ -8,6 +8,11 @@
 //! that is incomplete ("torn write" from a crash) or fails its checksum ends
 //! the log. Everything from that point on is truncated away, so new appends
 //! always start at a clean record boundary.
+//!
+//! Failure rule: if an append fails (write or fsync), the log is "poisoned" and
+//! refuses further appends. The file may now hold a partial record, and nothing
+//! may be written after it. Reopening the log runs normal recovery, which
+//! truncates the partial record.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -20,6 +25,8 @@ const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 pub struct Wal {
     file: File,
     sync_on_append: bool,
+    /// Set after a failed append; cleared only by reopening the log.
+    poisoned: bool,
 }
 
 impl Wal {
@@ -28,14 +35,24 @@ impl Wal {
     ///
     /// With `sync_on_append`, each append is flushed to disk (`fsync`) before
     /// returning, which is what makes an acknowledged write durable. It is also
-    /// the main throughput limiter; batching writes to be done later!
+    /// the main throughput limiter; batching writes is planned for Phase 5.
+    ///
+    /// When the file is newly created, the parent directory is fsynced too, so
+    /// the file's existence survives a crash.
     pub fn open<P: AsRef<Path>>(path: P, sync_on_append: bool) -> io::Result<(Wal, Vec<Vec<u8>>)> {
+        let path = path.as_ref();
+        let existed = path.exists();
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
+
+        if !existed {
+            sync_parent_dir(path)?;
+        }
 
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
@@ -58,6 +75,7 @@ impl Wal {
             Wal {
                 file,
                 sync_on_append,
+                poisoned: false,
             },
             records,
         ))
@@ -65,7 +83,16 @@ impl Wal {
 
     /// Appends one record. The header and payload go out in a single write call
     /// to keep the window for a torn header as small as possible.
+    ///
+    /// If the write or the fsync fails, the log is poisoned and every later
+    /// append returns an error until the log is reopened.
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "WAL is poisoned after a failed write; reopen it to recover",
+            ));
+        }
+
         let len = u32::try_from(payload.len())
             .ok()
             .filter(|&l| l <= MAX_RECORD_LEN)
@@ -76,12 +103,36 @@ impl Wal {
         buf.extend_from_slice(&crc32(payload).to_le_bytes());
         buf.extend_from_slice(payload);
 
-        self.file.write_all(&buf)?;
-        if self.sync_on_append {
-            self.file.sync_data()?;
+        let result = self.file.write_all(&buf).and_then(|_| {
+            if self.sync_on_append {
+                self.file.sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        if result.is_err() {
+            self.poisoned = true;
         }
-        Ok(())
+        result
     }
+}
+
+/// Fsyncs the directory containing `path`, so a newly created file is durable.
+/// Directories cannot be opened this way on Windows, so it does nothing there.
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Parses the record starting at `offset`. Returns the payload and the offset of
@@ -165,5 +216,29 @@ mod tests {
             records,
             vec![b"one".to_vec(), Vec::new(), b"three".to_vec()]
         );
+    }
+
+    #[test]
+    fn poisoned_wal_refuses_appends_until_reopened() {
+        let tmp = TempFile::new("poison");
+        let (mut wal, _) = Wal::open(&tmp.0, false).unwrap();
+        wal.append(b"good").unwrap();
+
+        wal.poisoned = true; // simulate an earlier I/O failure
+        assert!(wal.append(b"nope").is_err());
+        drop(wal);
+
+        let (mut wal, records) = Wal::open(&tmp.0, false).unwrap();
+        assert_eq!(records, vec![b"good".to_vec()]);
+        wal.append(b"after").unwrap();
+    }
+
+    #[test]
+    fn creating_a_new_log_works_with_sync_enabled() {
+        // Exercises the parent-directory fsync path on platforms that have it.
+        let tmp = TempFile::new("create-sync");
+        let (mut wal, existing) = Wal::open(&tmp.0, true).unwrap();
+        assert!(existing.is_empty());
+        wal.append(b"x").unwrap();
     }
 }
